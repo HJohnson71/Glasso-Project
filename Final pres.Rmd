@@ -1,0 +1,449 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(Matrix)  
+library(glassoFast)
+rglasso.path <- function(S, lambda, weight = TRUE, nlambda, ratio){
+  
+  if(weight){
+    W <- sqrt(diag(S) %o% diag(S))
+  }else{
+    W <- matrix(1, nrow(S), ncol(S))
+  }
+  
+  diag(W) <- 0
+  
+  if(missing(lambda)){
+    lambda.max <- max(abs((S/W)[upper.tri(S)]))
+    lambda.min <- ratio * lambda.max
+    lambda <- exp(seq(log(lambda.min), log(lambda.max), length = nlambda))
+  }
+  
+  f <- function(rho){
+    res <- glassoFast::glassoFast(S, rho * W)
+    return(list(w = res$w, wi = res$wi))
+  }
+  
+  out <- lapply(lambda, FUN = f)
+  w <- lapply(out, function(x) x$w)
+  wi <- lapply(out, function(x) x$wi)
+  
+  return(list(w = w, wi = wi, lambda = lambda))
+}
+
+IC.rglasso <- function(out, s, n){
+  
+  f <- function(wi){
+    nll <- -log(det(wi)) + sum(wi * s)
+    J <- sum(wi[upper.tri(wi, diag = TRUE)] != 0)
+    return(c(aic = nll + (2/n)*J, bic = nll + (log(n)/n)*J))
+  }
+  
+  res <- sapply(out$wi, FUN = f)
+  
+  return(res)
+}
+
+
+# rglasso(covU,weight = TRUE, N=nrow(set1)-1)
+# S <- covU
+# weight = TRUE
+# N=nrow(set1)-1
+# nlambda = 10
+# ratio <- sqrt(log(nrow(S))/N)
+
+rglasso <- function(S, lambda = "aic", weight = TRUE, nlambda = 10, ratio, N){
+  
+  if(lambda == "aic" | lambda == "bic"){
+    
+    if(missing(ratio)) ratio <- sqrt(log(nrow(S))/N)
+    
+    out <- rglasso.path(S, weight = weight, nlambda = nlambda, ratio = ratio)
+    ic <- IC.rglasso(out, S, N)
+    
+    ##For referees##
+    bics <- ic[2, ]
+    lambdas <- out[["lambda"]]
+    precisions <- out$wi
+    precisions2 <- out$wi
+    for (a in 1: length(precisions)) {
+      diag(precisions[[a]])<- 1
+    }
+    zeroes <- NULL
+    for (i in 1:(length(precisions))) {
+      zeroes = append(zeroes, as.numeric(length(precisions[[i]])-nnzero(precisions[[i]])) / as.numeric (length(precisions[[i]]) ),after = length(zeroes))
+    }
+    ################
+    
+    idx <- which.min(ic[lambda, ])
+    #w <- out$w[[idx]]
+    wi <- out$wi[[idx]]
+    w <- solve(wi)
+    lambda <- out$lambda[idx]
+    
+  }else{
+    out <- rglasso.path(S, lambda = lambda, weight = weight)
+    #w <- out$w[[1]]
+    wi <- out$wi[[1]]
+    w <- solve(wi)
+  }
+  
+  attr(w, "lambda") <- lambda
+  attr(wi, "lambda") <- lambda
+  
+  dimnames(w) <- dimnames(S)
+  dimnames(wi) <- dimnames(S)
+  return(list(cmat = w, pmat = wi, bics = bics, lambdas = lambdas, precisions = precisions, precisions_diag = precisions2, idx = idx,lambda = lambda, zeroes = zeroes))
+  # return(list(cmat = w, pmat = wi, bics = bics, lambdas = lambdas, precisions = precisions, zeroes = zeroes))
+}
+```
+# Fama French factors Minimum Variance port, vs SPY and balanced
+```{r}
+# Libraries
+library(tidyverse)
+library(lubridate)
+library(RSQLite)
+library(broom)
+
+# Load and preprocess the data
+econ5200 <- dbConnect(SQLite(), "C:/Users/hunte/Downloads/Econ5200/Data/econ5200_db.sqlite", extended_types = TRUE)
+
+crsp_monthly <- tbl(econ5200, "crsp_monthly") %>%
+  select(permno, month, ret_excess) %>%
+  collect()
+
+ff3_monthly_excess <- tbl(econ5200, "factors_ff3_monthly") %>%
+  select(-rf) %>%
+  collect()
+
+crsp_monthly <- crsp_monthly %>%
+  left_join(ff3_monthly_excess, by = "month") %>%
+  filter(month > "2010-01-01") %>%
+  drop_na()
+
+pivot_df <- crsp_monthly %>%
+  pivot_wider(names_from = permno, values_from = ret_excess)
+
+pivot <- pivot_df %>% 
+  select(where(~!any(is.na(.)))) %>%
+  mutate(month = as.Date(month))
+
+# Portfolio weight functions
+gmv_portfolio <- function(precision_matrix) {
+  ones <- rep(1, ncol(precision_matrix))
+  weights <- solve(precision_matrix, ones) / sum(solve(precision_matrix, ones))
+  return(weights)
+}
+
+# Rolling window portfolio rebalancing
+start_year <- 2015
+rolling_window <- 60  # 5 years of monthly data
+transaction_fee <- 0.10
+balanced_weights <- rep(1 / ncol(pivot %>% select(-month, -mkt_excess, -smb, -hml)), ncol(pivot %>% select(-month, -mkt_excess, -smb, -hml)))
+
+portfolio_returns <- vector()
+balanced_returns <- vector()
+
+for (year in start_year:2023) {
+  # Define rolling window
+  rolling_start <- as.Date(paste0(year - 5, "-01-01"))
+  rolling_end <- as.Date(paste0(year - 1, "-12-31"))
+  
+  train_data <- pivot %>%
+    filter(month >= rolling_start & month <= rolling_end)
+  
+  test_data <- pivot %>%
+    filter(year(month) == year)
+  
+  # Extract matrices
+  R_train <- train_data %>%
+    select(-month, -mkt_excess, -smb, -hml) %>%
+    as.matrix()
+  
+  factors_train <- train_data %>%
+    select(mkt_excess, smb, hml) %>%
+    as.matrix()
+  
+  # Fit factor model and compute residual covariance matrix
+  loadings <- t(apply(R_train, 2, function(ret) {
+    lm(ret ~ factors_train - 1)$coefficients
+  }))
+  
+  residuals <- R_train - factors_train %*% t(loadings)
+  residual_cov <- cov(residuals, use = "pairwise.complete.obs")
+  
+  # Compute precision matrix using graphical lasso
+  fgl_result <- rglasso(
+    S = residual_cov,
+    lambda = "bic",
+    weight = TRUE,
+    nlambda = 10,
+    ratio = sqrt(log(nrow(residual_cov)) / nrow(R_train)),
+    N = nrow(R_train)
+  )
+  
+  precision_matrix <- fgl_result$pmat
+  
+  # Compute GMV portfolio weights
+  weights <- gmv_portfolio(precision_matrix)
+  
+  # Adjust for transaction fee
+  weights <- weights * (1 - transaction_fee)
+  
+  # Normalize weights
+  weights <- weights / sum(weights)
+  
+  # Compute returns for the test year
+  R_test <- test_data %>%
+    select(-month, -mkt_excess, -smb, -hml) %>%
+    as.matrix()
+  
+  portfolio_return <- rowSums(R_test * weights)
+  portfolio_returns <- c(portfolio_returns, portfolio_return)
+  
+  # Balanced portfolio returns
+  balanced_return <- rowSums(R_test * balanced_weights)
+  balanced_returns <- c(balanced_returns, balanced_return)
+}
+
+library(tidyverse)
+library(zoo)
+
+# Assuming portfolio_returns (FGL) and balanced_returns are already computed in the loop
+# Replace the following lines with the real returns if available:
+# portfolio_returns <- c(...)  # FGL Portfolio Returns
+# balanced_returns <- c(...)  # Balanced Portfolio Returns
+
+# Compute cumulative returns
+cumulative_portfolio <- cumprod(1 + portfolio_returns)  # FGL
+cumulative_balanced <- cumprod(1 + balanced_returns)    # Balanced
+
+# Combine cumulative returns
+plot_data <- tibble(
+  month = seq_along(cumulative_portfolio),  # Replace with actual dates if available
+  Balanced = cumulative_balanced,
+  FGL = cumulative_portfolio
+)
+
+# Rolling volatility function
+rolling_sd <- function(returns, window = 12) {
+  zoo::rollapply(returns, window, sd, fill = NA, align = "right")
+}
+
+# Calculate rolling volatilities
+volatility_balanced <- rolling_sd(balanced_returns)
+volatility_portfolio <- rolling_sd(portfolio_returns)
+
+# Sharpe Ratio Function
+sharpe_ratio <- function(returns, risk_free_rate = 0.03 / 12) {
+  mean(returns, na.rm = TRUE) / sd(returns, na.rm = TRUE)
+}
+
+# Calculate metrics
+summary_table <- tibble(
+  Strategy = c("Balanced", "FGL"),
+  Total_Cumulative_Return = c(last(cumulative_balanced), last(cumulative_portfolio)),
+  Average_Volatility = c(mean(volatility_balanced, na.rm = TRUE), mean(volatility_portfolio, na.rm = TRUE)),
+  Sharpe_Ratio = c(sharpe_ratio(balanced_returns), sharpe_ratio(portfolio_returns))
+)
+
+# Plot cumulative returns
+cumulative_plot <- plot_data %>%
+  pivot_longer(-month, names_to = "Portfolio", values_to = "Cumulative Return") %>%
+  ggplot(aes(x = month, y = `Cumulative Return`, color = Portfolio)) +
+  geom_line() +
+  labs(
+    title = "Cumulative Returns: Balanced vs. FGL Portfolio",
+    x = "Month",
+    y = "Cumulative Return",
+    color = "Portfolio"
+  ) +
+  theme_minimal()
+
+# Display plot
+print(cumulative_plot)
+
+# Print summary table
+print(summary_table)
+```
+```{r}
+# Assuming SPY data has already been fetched
+# SPY returns and cumulative returns
+spy_returns <- spy_data$ret_excess
+cumulative_spy <- cumprod(1 + spy_returns)
+
+# Add SPY to the plot data
+plot_data <- tibble(
+  month = seq_along(cumulative_portfolio),  # Replace with actual dates if available
+  Balanced = cumulative_balanced,
+  FGL = cumulative_portfolio,
+  SPY = cumulative_spy
+)
+
+# Plot cumulative returns including SPY
+cumulative_plot <- plot_data %>%
+  pivot_longer(-month, names_to = "Portfolio", values_to = "Cumulative Return") %>%
+  ggplot(aes(x = month, y = `Cumulative Return`, color = Portfolio)) +
+  geom_line() +
+  labs(
+    title = "Cumulative Returns: Balanced vs. FGL Portfolio vs. SPY",
+    x = "Month",
+    y = "Cumulative Return",
+    color = "Portfolio"
+  ) +
+  theme_minimal()
+
+# Display plot
+print(cumulative_plot)
+```
+
+```{r}
+# Define MRC Portfolio function
+mrc_portfolio <- function(precision_matrix, expected_returns, target_risk) {
+  # Ensure expected_returns is a column matrix
+  expected_returns <- matrix(expected_returns, ncol = 1)
+  # Compute the denominator: sqrt(m' * Θ * m) 
+  denominator <- sqrt(t(expected_returns) %*% precision_matrix %*% expected_returns)
+  print(denominator)
+  # Compute the weights
+  scalar <- as.numeric(target_risk / denominator)
+  print(scalar)
+  weights <- scalar * (precision_matrix %*% expected_returns)
+  
+  # Return as a numeric vector
+  return(as.vector(weights))
+}
+
+# Rolling window portfolio rebalancing with MRC portfolio
+start_year <- 2015
+rolling_window <- 60  # 5 years of monthly data
+transaction_fee <- 0.10
+balanced_weights <- rep(1 / ncol(pivot %>% select(-month, -mkt_excess, -smb, -hml)), ncol(pivot %>% select(-month, -mkt_excess, -smb, -hml)))
+
+portfolio_returns <- vector()
+balanced_returns <- vector()
+
+for (year in start_year:2023) {
+  # Define rolling window
+  rolling_start <- as.Date(paste0(year - 5, "-01-01"))
+  rolling_end <- as.Date(paste0(year - 1, "-12-31"))
+  
+  train_data <- pivot %>%
+    filter(month >= rolling_start & month <= rolling_end)
+  
+  test_data <- pivot %>%
+    filter(year(month) == year)
+  
+  # Extract matrices
+  R_train <- train_data %>%
+    select(-month, -mkt_excess, -smb, -hml) %>%
+    as.matrix()
+  
+  factors_train <- train_data %>%
+    select(mkt_excess, smb, hml) %>%
+    as.matrix()
+  
+  # Fit factor model and compute residual covariance matrix
+  loadings <- t(apply(R_train, 2, function(ret) {
+    lm(ret ~ factors_train - 1)$coefficients
+  }))
+  
+  residuals <- R_train - factors_train %*% t(loadings)
+  residual_cov <- cov(residuals, use = "pairwise.complete.obs")
+  
+  # Compute precision matrix using graphical lasso
+  fgl_result <- rglasso(
+    S = residual_cov,
+    lambda = "bic",
+    weight = TRUE,
+    nlambda = 10,
+    ratio = sqrt(log(nrow(residual_cov)) / nrow(R_train)),
+    N = nrow(R_train)
+  )
+  
+  precision_matrix_sr <- fgl_result$pmat
+
+  # Estimate expected returns from the rolling window
+  expected_returns <- colMeans(R_train, na.rm = TRUE)
+
+  # Target risk level
+  target_risk <- 0.15  # Adjust as needed
+  
+  # Compute MRC portfolio weights
+  weights <- mrc_portfolio(precision_matrix_sr, expected_returns, target_risk)
+  
+  # Adjust for transaction fee
+  weights <- weights * (1 - transaction_fee)
+  
+  # Normalize weights
+  weights <- weights / sum(weights)
+  
+  # Compute returns for the test year
+  R_test <- test_data %>%
+    select(-month, -mkt_excess, -smb, -hml) %>%
+    as.matrix()
+  
+  portfolio_return <- rowSums(R_test * weights)
+  portfolio_returns <- c(portfolio_returns, portfolio_return)
+  
+  # Balanced portfolio returns
+  balanced_return <- rowSums(R_test * balanced_weights)
+  balanced_returns <- c(balanced_returns, balanced_return)
+}
+
+
+# Compute cumulative returns
+cumulative_portfolio <- cumprod(1 + portfolio_returns)  # MRC
+cumulative_balanced <- cumprod(1 + balanced_returns)    # Balanced
+
+# Combine cumulative returns
+plot_data <- tibble(
+  month = seq_along(cumulative_portfolio),  # Replace with actual dates if available
+  Balanced = cumulative_balanced,
+  MRC = cumulative_portfolio
+)
+
+# Rolling volatility function
+rolling_sd <- function(returns, window = 12) {
+  zoo::rollapply(returns, window, sd, fill = NA, align = "right")
+}
+
+# Calculate rolling volatilities
+volatility_balanced <- rolling_sd(balanced_returns)
+volatility_portfolio <- rolling_sd(portfolio_returns)
+
+# Sharpe Ratio Function
+sharpe_ratio <- function(returns, risk_free_rate = 0.03 / 12) {
+  mean(returns, na.rm = TRUE) / sd(returns, na.rm = TRUE)
+}
+
+# Calculate metrics
+summary_table <- tibble(
+  Strategy = c("Balanced", "MRC"),
+  Total_Cumulative_Return = c(last(cumulative_balanced), last(cumulative_portfolio)),
+  Average_Volatility = c(mean(volatility_balanced, na.rm = TRUE), mean(volatility_portfolio, na.rm = TRUE)),
+  Sharpe_Ratio = c(sharpe_ratio(balanced_returns), sharpe_ratio(portfolio_returns))
+)
+
+# Plot cumulative returns
+cumulative_plot <- plot_data %>%
+  pivot_longer(-month, names_to = "Portfolio", values_to = "Cumulative Return") %>%
+  ggplot(aes(x = month, y = `Cumulative Return`, color = Portfolio)) +
+  geom_line() +
+  labs(
+    title = "Cumulative Returns: Balanced vs. MRC Portfolio",
+    x = "Month",
+    y = "Cumulative Return",
+    color = "Portfolio"
+  ) +
+  theme_minimal()
+
+# Display plot
+print(cumulative_plot)
+
+# Print summary table
+print(summary_table)
+```
