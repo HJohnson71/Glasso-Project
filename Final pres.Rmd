@@ -162,7 +162,6 @@ print(cumulative_plot)
 print(summary_table)
 ```
 ```{r}
-# Assuming SPY data has already been fetched
 # SPY returns and cumulative returns
 spy_returns <- spy_data$ret_excess
 cumulative_spy <- cumprod(1 + spy_returns)
@@ -190,5 +189,4 @@ cumulative_plot <- plot_data %>%
 
 # Display plot
 print(cumulative_plot)
-```
 ```
