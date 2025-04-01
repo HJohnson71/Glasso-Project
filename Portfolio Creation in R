@@ -115,7 +115,7 @@ cumulative_balanced <- cumprod(1 + balanced_returns)    # Balanced
 
 # Combine cumulative returns
 plot_data <- tibble(
-  month = seq_along(cumulative_portfolio),  # Replace with actual dates if available
+  month = seq_along(cumulative_portfolio),
   Balanced = cumulative_balanced,
   FGL = cumulative_portfolio
 )
